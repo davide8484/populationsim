@@ -19,11 +19,11 @@
 #   "GCCSA", "state"}.
 #   3. region (character): the name of the region for which to generate the IDs. I.e. the name of the region_level.
 # 
-# Output is a list with 5 elements. The first four are vectors containing the ages, household IDs, school IDs, 
-# and workplace IDs of the individuals living in the region. A school ID of NA indicates the individual does not 
-# attend school; a workplace ID of NA indicates the individual does not have a workplace. The fifth element is a 
-# data set containing the IDs along with other info which might be of use, such as labour force status and sector 
-# and industry of employment. 
+# Output is a list with 6 elements. The first four are vectors containing the ages, household IDs, school IDs, 
+# workplace IDs, and university IDs of the individuals living in the region. A school ID of NA indicates the 
+# individual does not attend school; a workplace ID of NA indicates the individual does not have a workplace. 
+# The fifth element is a data set containing the IDs along with other info which might be of use, such as labour 
+# force status and sector and industry of employment. 
 
 age.and.id.generator.generator <- function(rand_seed, region_level, region) {
   
@@ -50,11 +50,20 @@ age.and.id.generator.generator <- function(rand_seed, region_level, region) {
   # (iv) Correspondence between the geocodes:
   load("SA_corr.RData")
   
+  # (v) Probabilities for uni attendance:
+  load("prob_uni_id.RData") # Prob attend particular uni, conditional on being a uni student
+  load("prob_attend_uni_long.RData") # Prob attend uni, conditional on age and GCCSA (based on Census)
+
+  # (vi) Data for assigning staff to schools:
+  load("staff_to_student_ratios.RData") # Staff to student ratios per SA4
+  load("sa4_staff_school_probs.Rdata") # Probability of being in school j, given you are a teacher (per SA4). Based on staff counts per school.
+  load("ages_staff_cdf.RData") # Probabilities to use in drawing staff ages (based on contact matrices)
+  
   # Set the inputs:
   max_child_age <- 30
   min_adult_age <- 18
   group_sig <- 5 # Standard deviation of ages in group household
-  prop_thresh <- 0.98 # Proportion of population assigned to houses according to our rules 
+  prop_thresh <- 0.95 # Proportion of population assigned to houses according to our rules 
   max_failures <- 10 # Number of failures allowed before household is randomly formed
   
   set.seed(rand_seed)
@@ -261,7 +270,7 @@ age.and.id.generator.generator <- function(rand_seed, region_level, region) {
       }
       
       prop_assigned <- total_people/pop_size # Track proportion of SA2's people assigned to houses
-      print(prop_assigned) 
+      print(c(prop_assigned, SA2)) 
     }
     
     # Assign the remaining population to households by copying previous households:
@@ -371,10 +380,93 @@ age.and.id.generator.generator <- function(rand_seed, region_level, region) {
       
     }
     
+    
+    ##########################################
+    
+    # Assign students to universities. 
+    
+    houses$uni_id <- 0 # Set all the uni IDs as 0
+    
+    # Get the SA2's GCCSA and state:
+    region_gccsa <- subset(SA_corr, SA2==region_SA2)$GCCSA
+    region_state <- subset(SA_corr, SA2==region_SA2)$STATE
+    
+    # If state is ACT, set as NSW for the purpose of assignment of students to unis:
+    region_state <- ifelse(region_state=="Australian Capital Territory", "New South Wales", region_state)
+    
+    # Get the probabilities of attending uni, given age and the SA2's GCCSA:
+    uni_age_probs <- subset(prob_attend_uni_long, GCCSA==region_gccsa) 
+    
+    # Get the probabilities of attending each uni, conditional on attending uni (in the state):
+    uni_id_probs <- subset(prob_uni_id, state==region_state)
+    
+    # Iterate through the population and assign students to unis:
+    for (i in 1:length(houses[,5])) {
+      
+      indiv_age <- houses$Age[i] # Get individual's age
+      prob_attend_uni <- subset(uni_age_probs, Age==indiv_age)$prob # Get prob attend uni, given age
+      attend_uni_flag <- as.integer(runif(1,0,1) <= prob_attend_uni) # Flag whether individual attends uni, based on prob
+      
+      # Select the uni ID randomly from the relevant CDF:
+      houses$uni_id[i] <- ifelse(attend_uni_flag==1, sum(uni_id_probs$cum_prob < runif(1,0,1)) + 1, NA)
+      
+    }
+    
+    
+    ##########################################
+    
+    # Assign the school staff to schools. 
+    
+    # Get the region's number of teaching staff:
+    
+    num_students <- sum(is.na(houses$school_id)==FALSE) # Number of students in SA2
+    # Staff to student ratio:
+    staff_to_student_ratio <- subset(staff_to_student_ratios, SA4==region_SA4)$staff_to_student_ratio
+    num_staff <- ceiling(num_students * staff_to_student_ratio) # Number of school staff in the SA2
+    
+    # Assign each staff member to a school:
+    for (i in 1:num_staff) {
+      
+      # Draw the age of the staff member:
+      staff_age <- sum(ages_staff_cdf$cum_prob < runif(1,0,1)) + 21
+
+      # Draw the school ID for the staff member:
+      candidate_schools <- subset(sa4_staff_school_probs, SA4==region_SA4)
+      staff_school_ind <- sum(candidate_schools$cum_prob < runif(1,0,1)) + 1
+      staff_school_id <- candidate_schools$school_id[staff_school_ind]
+      
+      # Get the indices of the household data which can be set as the teacher:
+      candidates <- which(houses$Age > (staff_age - 3) 
+                          & houses$Age < (staff_age + 3) 
+                          & houses$Age > 19 # Minimum age of staff member is 20
+                          & houses$Age < 71 # Max age of staff member is 70
+                          & is.na(houses$workplace_id)==FALSE) # In labour force
+                          
+      
+      # If there is at least one appropriate candidate, select the first one and 
+      if (length(candidates) > 0) {
+        
+        ind <- sample(candidates,1) # Randomly choose an index from the candidates
+        houses$school_id[ind] <- staff_school_id # Set the school ID for that index (staff member)
+        houses$workplace_id[ind] <- NA # Remove workplace ID (since staff member assigned to school)
+        
+      }
+      
+    }
+    
+    
+
+    
+    
+    
+    ###########################################
+    
     houses$SA2 <- SA2
     houses$Household_id <- as.character(as.numeric(houses$Household_id) + counter_house_ids)
     counter_house_ids <- max(as.numeric(houses$Household_id))
     store_SA2s[[loc]] <- houses # Store SA2's households as list element
+    
+    
   }
   
   households_data <- bind_rows(store_SA2s, .id="column_label") # Concatenate list elements into data frame
@@ -382,17 +474,18 @@ age.and.id.generator.generator <- function(rand_seed, region_level, region) {
   households_data$person_id <- c(1:length(households_data[,1])) # Create person ID
   
   # Keep only relevant variables:
-  households_data <- households_data %>% select(person_id, Type, Age, Household_id, school_id, workplace_id, lf_status, lf_sector, lf_industry, SA2, SA3, SA4, GCCSA, STATE)
-  names(households_data) <- c("person_id", "household_type", "age", "household_id", "school_id", "workplace_id", "lf_status", "lf_sector", "lf_industry", "SA2", "SA3", "SA4", "GCCSA", "STATE")
+  households_data <- households_data %>% dplyr::select(person_id, Type, Age, Household_id, school_id, workplace_id, uni_id, lf_status, lf_sector, lf_industry, SA2, SA3, SA4, GCCSA, STATE)
+  names(households_data) <- c("person_id", "household_type", "age", "household_id", "school_id", "workplace_id", "uni_id", "lf_status", "lf_sector", "lf_industry", "SA2", "SA3", "SA4", "GCCSA", "STATE")
   
-  # Get vectors of inhabitants ages, household IDs, school IDs, and workplace IDs:
+  # Get vectors of inhabitants' ages, household IDs, school IDs, and workplace IDs:
   outputs <- list(vector.of.ages.specific.to.region <- households_data$age,
                   vector.of.ig.household.ids.specific.to.region <- households_data$household_id,
                   vector.of.ig.school.ids.specific.to.region <- households_data$school_id,
                   vector.of.ig.workplace.ids.specific.to.region <- households_data$workplace_id,
+                  vector.of.ig.uni.ids.specific.to.region <- households_data$uni_id, 
                   households.data <- households_data)
   
-  names(outputs) <- c("age", "household_id", "school_id", "workplace_id", "household_data")
+  names(outputs) <- c("age", "household_id", "school_id", "workplace_id", "uni_id", "household_data")
   
   return(outputs)
   
